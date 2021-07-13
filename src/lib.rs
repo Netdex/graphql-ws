@@ -1,14 +1,16 @@
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{future, SinkExt, Stream, StreamExt};
 use std::convert::TryInto;
 use std::marker::PhantomData;
 
 use graphql_client::{GraphQLQuery, QueryBody, Response};
+use thiserror::Error;
 use tokio::{
     net::TcpStream,
     sync::{broadcast, mpsc},
+    task::JoinHandle,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{tungstenite, MaybeTlsStream, WebSocketStream};
 
 use crate::protocol::{ClientMessage, ClientPayload, ServerMessage};
 
@@ -29,41 +31,57 @@ impl GraphQLWebSocket {
         }
     }
 
+    /// Initialize a GraphQLWS connection over the provided WebSocket.
+    /// Optionally provide the provided payload as part of the ConnectionInit
+    /// message.
     pub fn connect(
         &mut self,
         socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
         payload: Option<serde_json::Value>,
-    ) {
-        let (mut write, read) = socket.split();
+    ) -> JoinHandle<Result<(), Error>> {
+        let (mut write, mut read) = socket.split();
         let server_tx = self.server_tx.clone();
-        tokio::spawn(async move {
-            read.for_each(|message| async {
-                let _ = server_tx.send(message.unwrap().try_into().unwrap()); // TODO error handling
-            })
-            .await;
+        let recv_fut: future::BoxFuture<Result<(), Error>> = Box::pin(async move {
+            while let Some(message) = read.next().await {
+                let msg = message?;
+                let _ = server_tx.send(
+                    msg.clone()
+                        .try_into()
+                        .map_err(|_| Error::MessageFormat(msg))?,
+                );
+            }
+            Ok::<(), Error>(())
         });
         let mut client_rx = self.client_tx.subscribe();
-        tokio::spawn(async move {
+        let send_fut: future::BoxFuture<Result<(), Error>> = Box::pin(async move {
             write
                 .send(ClientMessage::ConnectionInit { payload }.into())
                 .await?;
             while let Ok(message) = client_rx.recv().await {
                 write.send(message.into()).await?;
             }
-            // TODO do something with this error
-            Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+            Ok::<(), Error>(())
         });
+        tokio::spawn(async move {
+            future::try_join_all(vec![recv_fut, send_fut])
+                .await
+                .map(|_| ())
+        })
     }
 
+    /// Execute the GraphQL query or mutation against the remote engine.
     pub async fn query<Query: GraphQLQuery>(
         &mut self,
         variables: Query::Variables,
-    ) -> Result<Response<Query::ResponseData>, serde_json::Value> {
+    ) -> Result<Response<Query::ResponseData>, Error> {
         let op = self.subscribe::<Query>(variables);
         let mut stream = op.execute();
-        stream.next().await.unwrap()
+        let response = stream.next().await.ok_or(Error::NoResponse)?;
+        response
     }
 
+    /// Execute the GraphQL query or mutation against the remote engine,
+    /// returning only response data and panicking if an error occurs.
     pub async fn query_unchecked<Query: GraphQLQuery>(
         &mut self,
         variables: Query::Variables,
@@ -74,6 +92,7 @@ impl GraphQLWebSocket {
         response.data.unwrap()
     }
 
+    /// Return a handle to a GraphQL subscription.
     pub fn subscribe<Query: GraphQLQuery>(
         &mut self,
         variables: Query::Variables,
@@ -89,6 +108,8 @@ impl GraphQLWebSocket {
     }
 }
 
+/// A handle to a long-lived GraphQL operation. Drop the handle to end the
+/// operation.
 pub struct GraphQLOperation<Query: GraphQLQuery> {
     id: String,
     payload: ClientPayload,
@@ -97,7 +118,7 @@ pub struct GraphQLOperation<Query: GraphQLQuery> {
     _query: PhantomData<Query>,
 }
 impl<Query: GraphQLQuery> GraphQLOperation<Query> {
-    pub fn new(
+    fn new(
         id: String,
         query_body: QueryBody<Query::Variables>,
         server_tx: broadcast::Sender<ServerMessage>,
@@ -116,9 +137,9 @@ impl<Query: GraphQLQuery> GraphQLOperation<Query> {
         }
     }
 
-    pub fn execute(
-        self,
-    ) -> impl Stream<Item = Result<Response<Query::ResponseData>, serde_json::Value>> {
+    /// Execute the subscription against the remote GraphQL engine. Returns a
+    /// Stream of responses.
+    pub fn execute(self) -> impl Stream<Item = Result<Response<Query::ResponseData>, Error>> {
         let (tx, rx) = mpsc::channel(16);
 
         let client_tx = self.client_tx.clone();
@@ -129,24 +150,32 @@ impl<Query: GraphQLQuery> GraphQLOperation<Query> {
             payload: self.payload.clone(),
         };
         tokio::spawn(async move {
-            let _ = client_tx.send(query_msg).unwrap(); // TODO error handling
+            if let Err(_) = client_tx.send(query_msg) {
+                return;
+            }
             while let Ok(msg) = server_rx.recv().await {
                 match msg {
                     ServerMessage::Data { id, payload } if id == op_id => {
-                        let _ = tx.send(Ok(payload)).await.unwrap();
+                        if let Err(_) = tx.send(Ok(payload)).await {
+                            return;
+                        }
                     }
                     ServerMessage::Complete { id } if id == op_id => {
                         return;
                     }
                     ServerMessage::ConnectionError { payload } => {
-                        let _ = tx.send(Err(payload)).await.unwrap();
+                        let _ = tx.send(Err(Error::GraphQl(payload))).await;
                         return;
                     }
                     ServerMessage::Error { id, payload } if id == op_id => {
-                        let _ = tx.send(Err(payload)).await.unwrap();
+                        if let Err(_) = tx.send(Err(Error::GraphQl(payload))).await {
+                            return;
+                        }
                     }
                     ServerMessage::ConnectionAck => {}
-                    ServerMessage::ConnectionKeepAlive => {}
+                    ServerMessage::ConnectionKeepAlive => {
+                        // we should probably send something back...
+                    }
                     _ => {}
                 }
             }
@@ -167,4 +196,16 @@ impl<Query: GraphQLQuery> Drop for GraphQLOperation<Query> {
             })
             .unwrap();
     }
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("websocket error")]
+    WebSocket(#[from] tungstenite::Error),
+    #[error("graphql protocol error")]
+    GraphQl(serde_json::Value),
+    #[error("invalid message format")]
+    MessageFormat(tungstenite::Message),
+    #[error("expected response, but none received")]
+    NoResponse,
 }
