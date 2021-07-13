@@ -1,6 +1,7 @@
 use futures::{future, SinkExt, Stream, StreamExt};
-use std::convert::TryInto;
 use std::marker::PhantomData;
+use std::sync::Mutex;
+use std::{convert::TryInto, sync::Arc};
 
 use graphql_client::{GraphQLQuery, QueryBody, Response};
 use thiserror::Error;
@@ -16,18 +17,30 @@ use crate::protocol::{ClientMessage, ClientPayload, ServerMessage};
 
 mod protocol;
 
+#[derive(Clone)]
 pub struct GraphQLWebSocket {
-    id: u32,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+
     client_tx: broadcast::Sender<ClientMessage>,
     server_tx: broadcast::Sender<ServerMessage>,
+}
+
+struct State {
+    id: u32,
 }
 
 impl GraphQLWebSocket {
     pub fn new() -> Self {
         Self {
-            id: 0,
-            client_tx: broadcast::channel(16).0,
-            server_tx: broadcast::channel(16).0,
+            shared: Arc::new(Shared {
+                state: Mutex::new(State { id: 0 }),
+                client_tx: broadcast::channel(16).0,
+                server_tx: broadcast::channel(16).0,
+            }),
         }
     }
 
@@ -35,12 +48,12 @@ impl GraphQLWebSocket {
     /// Optionally provide the provided payload as part of the ConnectionInit
     /// message.
     pub fn connect(
-        &mut self,
+        &self,
         socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
         payload: Option<serde_json::Value>,
     ) -> JoinHandle<Result<(), Error>> {
         let (mut write, mut read) = socket.split();
-        let server_tx = self.server_tx.clone();
+        let server_tx = self.shared.server_tx.clone();
         let recv_fut: future::BoxFuture<Result<(), Error>> = Box::pin(async move {
             while let Some(message) = read.next().await {
                 let msg = message?;
@@ -52,7 +65,7 @@ impl GraphQLWebSocket {
             }
             Ok::<(), Error>(())
         });
-        let mut client_rx = self.client_tx.subscribe();
+        let mut client_rx = self.shared.client_tx.subscribe();
         let send_fut: future::BoxFuture<Result<(), Error>> = Box::pin(async move {
             write
                 .send(ClientMessage::ConnectionInit { payload }.into())
@@ -71,7 +84,7 @@ impl GraphQLWebSocket {
 
     /// Execute the GraphQL query or mutation against the remote engine.
     pub async fn query<Query: GraphQLQuery>(
-        &mut self,
+        &self,
         variables: Query::Variables,
     ) -> Result<Response<Query::ResponseData>, Error> {
         let op = self.subscribe::<Query>(variables);
@@ -83,7 +96,7 @@ impl GraphQLWebSocket {
     /// Execute the GraphQL query or mutation against the remote engine,
     /// returning only response data and panicking if an error occurs.
     pub async fn query_unchecked<Query: GraphQLQuery>(
-        &mut self,
+        &self,
         variables: Query::Variables,
     ) -> Query::ResponseData {
         let result = self.query::<Query>(variables).await;
@@ -94,16 +107,17 @@ impl GraphQLWebSocket {
 
     /// Return a handle to a GraphQL subscription.
     pub fn subscribe<Query: GraphQLQuery>(
-        &mut self,
+        &self,
         variables: Query::Variables,
     ) -> GraphQLOperation<Query> {
+        let mut state = self.shared.state.lock().unwrap();
         let op = GraphQLOperation::<Query>::new(
-            self.id.to_string(),
+            state.id.to_string(),
             Query::build_query(variables),
-            self.server_tx.clone(),
-            self.client_tx.clone(),
+            self.shared.server_tx.clone(),
+            self.shared.client_tx.clone(),
         );
-        self.id += 1;
+        state.id += 1;
         op
     }
 }
