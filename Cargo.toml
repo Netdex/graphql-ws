@@ -1,13 +1,13 @@
 [package]
 name = "graphql-ws"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Gordon Guan <admin@netdex.org>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-graphql_client = "0.9"
+graphql_client = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-tungstenite = { version = "0.15" }
 serde = { version = "1", features = ["derive"] }
