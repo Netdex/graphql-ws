@@ -205,11 +205,9 @@ impl<Query: GraphQLQuery + Send + Sync + 'static> GraphQLOperation<Query> {
 
 impl<Query: GraphQLQuery + Send + Sync + 'static> Drop for GraphQLOperation<Query> {
     fn drop(&mut self) {
-        self.client_tx
-            .send(ClientMessage::Stop {
-                id: self.id.clone(),
-            })
-            .unwrap();
+        let _ = self.client_tx.send(ClientMessage::Stop {
+            id: self.id.clone(),
+        });
     }
 }
 
