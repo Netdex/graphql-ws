@@ -60,17 +60,6 @@ pub enum ServerMessage {
     ConnectionKeepAlive,
 }
 
-impl ServerMessage {
-    pub fn id(&self) -> Option<&str> {
-        match self {
-            ServerMessage::Data { id, .. } => Some(&id),
-            ServerMessage::Error { id, .. } => Some(&id),
-            ServerMessage::Complete { id } => Some(&id),
-            _ => None,
-        }
-    }
-}
-
 impl From<ClientMessage> for protocol::Message {
     fn from(message: ClientMessage) -> Self {
         Message::Text(serde_json::to_string(&message).unwrap())
@@ -81,7 +70,6 @@ impl From<ClientMessage> for protocol::Message {
 pub enum MessageError {
     Decoding(serde_json::Error),
     InvalidMessage(protocol::Message),
-    WebSocket(tokio_tungstenite::tungstenite::Error),
 }
 
 impl TryFrom<protocol::Message> for ServerMessage {
@@ -89,9 +77,7 @@ impl TryFrom<protocol::Message> for ServerMessage {
 
     fn try_from(value: protocol::Message) -> Result<Self, MessageError> {
         match value {
-            Message::Text(value) => {
-                serde_json::from_str(&value).map_err(|e| MessageError::Decoding(e))
-            }
+            Message::Text(value) => serde_json::from_str(&value).map_err(MessageError::Decoding),
             _ => Err(MessageError::InvalidMessage(value)),
         }
     }
